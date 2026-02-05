@@ -114,12 +114,7 @@ pytest
 
 ## Mock Data
 
-The MVP uses mock data for 5-10 Boston area hospitals including:
-- Massachusetts General Hospital
-- Beth Israel Deaconess Medical Center
-- Brigham and Women's Hospital
-- Boston Medical Center
-- Newton-Wellesley Hospital
+The MVP uses mock data for Triangle, NC area hospitals
 
 ## License
 
