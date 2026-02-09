@@ -7,9 +7,46 @@ import pdfplumber
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import LLM extractor (optional, graceful fallback if not available)
+try:
+    from app.services.llm_extractor import extract_with_llm, is_llm_extraction_available
+    LLM_AVAILABLE = True
+except ImportError:
+    LLM_AVAILABLE = False
+    logger.info("LLM extractor not available, using regex-based extraction only")
 
-def extract_line_items(pdf_path: str) -> List[Dict]:
-    """Extract line items from a hospital bill PDF."""
+
+def extract_line_items(pdf_path: str, use_llm: bool = True) -> List[Dict]:
+    """
+    Extract line items from a hospital bill PDF.
+
+    Args:
+        pdf_path: Path to the PDF file
+        use_llm: Whether to try LLM extraction first (default True)
+
+    Uses LLM vision-based extraction when available, falls back to
+    regex-based parsing if LLM is unavailable or returns no results.
+    """
+    # Try LLM extraction first (more accurate for complex layouts)
+    if use_llm and LLM_AVAILABLE and is_llm_extraction_available():
+        logger.info("Attempting LLM-based extraction...")
+        llm_items = extract_with_llm(pdf_path)
+        if llm_items and len(llm_items) >= 3:  # Require at least 3 items for confidence
+            logger.info(f"LLM extraction successful: {len(llm_items)} items")
+            return llm_items
+        else:
+            logger.info("LLM extraction returned insufficient results, falling back to regex")
+    elif use_llm and LLM_AVAILABLE:
+        logger.info("LLM extraction not available (API key not set), using regex fallback")
+    elif use_llm:
+        logger.info("LLM extractor module not available, using regex fallback")
+
+    # Fallback: regex-based extraction
+    return extract_line_items_regex(pdf_path)
+
+
+def extract_line_items_regex(pdf_path: str) -> List[Dict]:
+    """Extract line items using regex-based parsing (fallback method)."""
     line_items = []
     debug_info = {
         "pages": 0,
@@ -35,9 +72,29 @@ def extract_line_items(pdf_path: str) -> List[Dict]:
             debug_info["text_lines"] = len(full_text.split('\n'))
             logger.info(f"Extracted {debug_info['text_lines']} lines of text")
 
-            # Strategy 1: Try to extract from tables
+            # Strategy 1: Try to extract from tables with explicit settings
+            # Use stricter table settings to avoid cell merging
+            table_settings = {
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+                "edge_min_length": 3,
+                "min_words_vertical": 1,
+                "min_words_horizontal": 1,
+            }
+
             for page_num, page in enumerate(pdf.pages):
-                tables = page.extract_tables()
+                # Try with strict settings first
+                tables = page.extract_tables(table_settings)
+
+                # If no tables found, try with text-based detection
+                if not tables:
+                    tables = page.extract_tables({
+                        "vertical_strategy": "text",
+                        "horizontal_strategy": "text",
+                    })
+
                 debug_info["tables_found"] += len(tables)
 
                 for table_idx, table in enumerate(tables):
@@ -45,10 +102,12 @@ def extract_line_items(pdf_path: str) -> List[Dict]:
                     for row in table:
                         debug_info["table_rows"] += 1
                         if row and len(row) >= 2:
-                            item = parse_table_row(row)
-                            if item:
-                                line_items.append(item)
-                                debug_info["items_from_tables"] += 1
+                            # Check if any cell contains merged content (multiple line items)
+                            items = parse_table_row_with_split(row)
+                            for item in items:
+                                if item:
+                                    line_items.append(item)
+                                    debug_info["items_from_tables"] += 1
 
             logger.info(f"Found {debug_info['items_from_tables']} items from tables")
 
@@ -94,11 +153,203 @@ def extract_line_items(pdf_path: str) -> List[Dict]:
     return line_items
 
 
+def parse_table_row_with_split(row: list) -> List[Optional[dict]]:
+    """
+    Parse a table row, detecting and splitting merged cells that contain multiple line items.
+
+    Returns a list of items (usually 1, but can be multiple if cells were merged).
+    """
+    # Convert cells to strings
+    cells = [str(c).strip() if c else "" for c in row]
+
+    # Check for signs of merged content in any cell
+    for cell in cells:
+        if not cell:
+            continue
+
+        # Look for multiple amounts in one cell (sign of merged rows)
+        amounts_in_cell = re.findall(r'\$?\s*([\d,]+\.\d{2})', cell)
+        if len(amounts_in_cell) >= 2:
+            logger.info(f"Detected merged cell with {len(amounts_in_cell)} amounts, attempting split")
+            return split_merged_cell(cell)
+
+        # Look for repeating patterns like "HC ... HC ..." which indicates merged descriptions
+        hc_pattern_count = len(re.findall(r'\bHC\s+', cell, re.IGNORECASE))
+        if hc_pattern_count >= 2:
+            logger.info(f"Detected merged cell with {hc_pattern_count} 'HC' patterns, attempting split")
+            return split_merged_descriptions(cells)
+
+        # Look for multiple HCPCS/CPT codes in description (not in code column)
+        # Skip if it's a short cell that's likely just a code
+        if len(cell) > 20:
+            codes_in_cell = re.findall(r'\b(?:[A-Z]\d{4}|\d{5})\b', cell)
+            if len(codes_in_cell) >= 2:
+                logger.info(f"Detected merged cell with {len(codes_in_cell)} codes: {codes_in_cell}")
+                return split_by_codes(cell)
+
+    # No merging detected, parse normally
+    result = parse_table_row(row)
+    return [result] if result else []
+
+
+def split_merged_cell(cell_text: str) -> List[Optional[dict]]:
+    """Split a cell that contains multiple merged line items based on amount patterns."""
+    items = []
+
+    # Try to split by finding amount patterns and their preceding descriptions
+    # Pattern: description followed by amount, possibly with code
+    pattern = r'([A-Za-z][^$\d]*?)\s*\$?\s*([\d,]+\.\d{2})'
+    matches = re.findall(pattern, cell_text)
+
+    for desc, amount_str in matches:
+        desc = desc.strip()
+        if len(desc) < 3:
+            continue
+
+        try:
+            amount = float(amount_str.replace(',', ''))
+            if amount > 0.5:
+                code = extract_code(desc)
+                items.append({
+                    "code": code,
+                    "description": re.sub(r'\s+', ' ', desc)[:100],
+                    "quantity": 1,
+                    "amount": amount,
+                })
+        except ValueError:
+            pass
+
+    return items if items else []
+
+
+def split_merged_descriptions(cells: list) -> List[Optional[dict]]:
+    """Split cells when descriptions appear to be merged (e.g., 'HC Item1 HC Item2')."""
+    items = []
+
+    # Find the cell with merged descriptions
+    merged_desc = ""
+    amounts = []
+
+    for cell in cells:
+        if not cell:
+            continue
+        # Collect amounts
+        cell_amounts = re.findall(r'\$?\s*([\d,]+\.\d{2})', cell)
+        amounts.extend([float(a.replace(',', '')) for a in cell_amounts])
+
+        # Find the longest text cell (likely the merged description)
+        if len(cell) > len(merged_desc) and not re.match(r'^[\d\$\.,\s]+$', cell):
+            merged_desc = cell
+
+    if not merged_desc:
+        return []
+
+    # Try to split by "HC " pattern (common hospital charge prefix)
+    parts = re.split(r'(?=\bHC\s+)', merged_desc, flags=re.IGNORECASE)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    if len(parts) <= 1:
+        # Try splitting by code patterns
+        parts = re.split(r'(?=\b(?:[A-Z]\d{4}|\d{5})\b)', merged_desc)
+        parts = [p.strip() for p in parts if p.strip() and len(p) > 5]
+
+    # Match parts with amounts (if we have the same number)
+    for i, part in enumerate(parts):
+        # Extract code from this part
+        code = extract_code(part)
+
+        # Clean description
+        desc = re.sub(r'\b(?:[A-Z]\d{4}|\d{5})\b', '', part)
+        desc = re.sub(r'\s+', ' ', desc).strip()
+
+        if len(desc) < 3:
+            continue
+
+        # Try to get corresponding amount
+        amount = None
+        if i < len(amounts):
+            amount = amounts[i]
+        elif amounts:
+            amount = amounts[0]  # Use first amount as fallback
+
+        if amount and amount > 0.5:
+            items.append({
+                "code": code,
+                "description": desc[:100],
+                "quantity": 1,
+                "amount": amount,
+            })
+
+    return items if items else []
+
+
+def split_by_codes(cell_text: str) -> List[Optional[dict]]:
+    """Split a cell that contains multiple codes into separate items."""
+    items = []
+
+    # Find all codes and their positions
+    code_matches = list(re.finditer(r'\b([A-Z]\d{4}|\d{5})\b', cell_text))
+
+    if len(code_matches) < 2:
+        return []
+
+    # Find all amounts
+    amounts = re.findall(r'\$?\s*([\d,]+\.\d{2})', cell_text)
+    amount_values = [float(a.replace(',', '')) for a in amounts]
+
+    # Split text by codes
+    for i, match in enumerate(code_matches):
+        code = match.group(1)
+
+        # Get description: text between this code and the next (or end)
+        start = match.end()
+        end = code_matches[i + 1].start() if i + 1 < len(code_matches) else len(cell_text)
+
+        desc_part = cell_text[start:end].strip()
+        # Remove amounts from description
+        desc_part = re.sub(r'\$?\s*[\d,]+\.\d{2}', '', desc_part)
+        desc_part = re.sub(r'\s+', ' ', desc_part).strip()
+
+        # Also check text before the code
+        if i == 0 and match.start() > 0:
+            prefix = cell_text[:match.start()].strip()
+            prefix = re.sub(r'\$?\s*[\d,]+\.\d{2}', '', prefix).strip()
+            if prefix and len(prefix) > 3:
+                desc_part = prefix + " " + desc_part
+
+        if len(desc_part) < 3:
+            desc_part = f"Procedure {code}"
+
+        # Match with amount
+        amount = None
+        if i < len(amount_values):
+            amount = amount_values[i]
+        elif amount_values:
+            # Try to find amount near this code in original text
+            code_pos = match.start()
+            for j, amt_match in enumerate(re.finditer(r'\$?\s*([\d,]+\.\d{2})', cell_text)):
+                if amt_match.start() > code_pos:
+                    amount = float(amt_match.group(1).replace(',', ''))
+                    break
+
+        if amount and amount > 0.5:
+            items.append({
+                "code": code,
+                "description": desc_part[:100],
+                "quantity": 1,
+                "amount": amount,
+            })
+
+    return items if items else []
+
+
 def parse_table_row(row: list) -> Optional[dict]:
     """Parse a table row into a line item."""
-    # Filter out empty cells
-    cells = [str(c).strip() if c else "" for c in row]
-    cells = [c for c in cells if c]
+    # Keep original cells with their positions (don't filter empty ones yet for column tracking)
+    original_cells = [str(c).strip() if c else "" for c in row]
+
+    # Filter out empty cells for processing
+    cells = [c for c in original_cells if c]
 
     if len(cells) < 2:
         return None
@@ -126,24 +377,67 @@ def parse_table_row(row: list) -> Optional[dict]:
     if amount is None:
         return None
 
-    # Look for CPT/HCPCS codes (various formats)
+    # Collect ALL codes found in the row, categorized by type
+    # We want to prefer CPT/HCPCS codes over revenue codes
+    cpt_codes = []       # 5-digit CPT codes
+    hcpcs_codes = []     # Letter + 4 digits (J2003, etc.)
+    revenue_codes = []   # 4-digit codes starting with 0
+
+    for idx, cell in enumerate(cells):
+        # Skip date-like cells (MM/DD/YYYY or similar)
+        if re.match(r'^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$', cell):
+            continue
+
+        # HCPCS codes (letter + 4 digits) - highest priority
+        hcpcs_match = re.search(r'\b([A-Z]\d{4})\b', cell)
+        if hcpcs_match:
+            hcpcs_codes.append((idx, hcpcs_match.group(1)))
+
+        # 5-digit CPT codes - high priority
+        cpt_match = re.search(r'\b(\d{5})\b', cell)
+        if cpt_match:
+            # Make sure it's not part of a longer number (like a phone number or date)
+            potential_cpt = cpt_match.group(1)
+            # CPT codes typically don't start with 0 and are in range 00100-99499
+            if not cell.replace(potential_cpt, '').strip().isdigit():
+                cpt_codes.append((idx, potential_cpt))
+
+        # Revenue codes (4 digits starting with 0) - lowest priority
+        rev_match = re.search(r'\b(0\d{3})\b', cell)
+        if rev_match:
+            revenue_codes.append((idx, rev_match.group(1)))
+
+    # Select the best code - prefer HCPCS > CPT > Revenue
+    # If multiple codes of same type, prefer ones NOT in the first 2 columns (col 0-1 are often date/rev code)
     code = None
-    for cell in cells:
-        # 5-digit CPT codes
-        code_match = re.search(r'\b(\d{5})\b', cell)
-        if code_match:
-            code = code_match.group(1)
-            break
-        # HCPCS codes (letter + 4 digits)
-        code_match = re.search(r'\b([A-Z]\d{4})\b', cell)
-        if code_match:
-            code = code_match.group(1)
-            break
-        # Revenue codes (4 digits starting with 0)
-        code_match = re.search(r'\b(0\d{3})\b', cell)
-        if code_match:
-            code = code_match.group(1)
-            break
+    code_source = None
+
+    # Log all codes found for debugging
+    if hcpcs_codes or cpt_codes or revenue_codes:
+        logger.debug(
+            f"Codes found in row: HCPCS={[c[1] for c in hcpcs_codes]}, "
+            f"CPT={[c[1] for c in cpt_codes]}, Revenue={[c[1] for c in revenue_codes]}"
+        )
+
+    if hcpcs_codes:
+        # Prefer HCPCS codes from later columns
+        hcpcs_codes.sort(key=lambda x: (0 if x[0] >= 2 else 1, x[0]))
+        code = hcpcs_codes[0][1]
+        code_source = "hcpcs"
+        logger.debug(f"Selected HCPCS code {code} from column {hcpcs_codes[0][0]}")
+    elif cpt_codes:
+        # Prefer CPT codes from later columns (column 3+ typically has the real CPT code)
+        cpt_codes.sort(key=lambda x: (0 if x[0] >= 2 else 1, x[0]))
+        code = cpt_codes[0][1]
+        code_source = "cpt"
+        logger.debug(f"Selected CPT code {code} from column {cpt_codes[0][0]}")
+    elif revenue_codes:
+        # Only use revenue code if no CPT/HCPCS found
+        # Prefer codes from column 2 or later
+        revenue_codes.sort(key=lambda x: (0 if x[0] >= 1 else 1, x[0]))
+        code = revenue_codes[0][1]
+        code_source = "revenue"
+        logger.debug(f"Selected Revenue code {code} from column {revenue_codes[0][0]} (no CPT/HCPCS found)")
 
     # Description is usually the longest text field that's not a number
     description = ""
@@ -156,7 +450,11 @@ def parse_table_row(row: list) -> Optional[dict]:
     if not description:
         return None
 
-    # Clean up description
+    # Clean up description - remove any embedded code in parentheses if we found a better code
+    if code and code_source in ("hcpcs", "cpt"):
+        # Remove things like (55150) from the description since we have the real code
+        description = re.sub(r'\s*\([A-Z0-9]{4,5}\)\s*', ' ', description)
+
     description = re.sub(r'\s+', ' ', description).strip()
 
     return {
@@ -279,18 +577,45 @@ def extract_from_text_aggressive(text: str) -> List[Dict]:
 
 
 def extract_code(text: str) -> Optional[str]:
-    """Extract CPT/HCPCS/Revenue code from text."""
-    # 5-digit CPT codes
-    match = re.search(r'\b(\d{5})\b', text)
-    if match:
-        return match.group(1)
+    """
+    Extract CPT/HCPCS/Revenue code from text.
 
-    # HCPCS codes (letter + 4 digits)
-    match = re.search(r'\b([A-Z]\d{4})\b', text)
-    if match:
-        return match.group(1)
+    Priority order:
+    1. HCPCS codes (letter + 4 digits like J2003) - highest priority
+    2. 5-digit CPT codes (like 99213)
+    3. Revenue codes (4 digits starting with 0) - lowest priority
 
-    # Revenue codes (4 digits, often starting with 0)
+    For each type, if multiple matches exist, prefer ones NOT in parentheses
+    (parenthetical codes are often internal references, not billing codes).
+    """
+    # First, try to find HCPCS codes (letter + 4 digits) - highest priority for drugs
+    hcpcs_matches = re.findall(r'\b([A-Z]\d{4})\b', text)
+    if hcpcs_matches:
+        # Prefer ones not in parentheses
+        for code in hcpcs_matches:
+            if f"({code})" not in text:
+                return code
+        return hcpcs_matches[0]
+
+    # 5-digit CPT codes - check if they look like valid CPT codes
+    cpt_matches = re.findall(r'\b(\d{5})\b', text)
+    if cpt_matches:
+        # Filter out unlikely CPT codes and prefer ones not in parentheses
+        valid_cpts = []
+        for code in cpt_matches:
+            # Skip if it's part of a phone number pattern or looks like a zip code
+            context = text[max(0, text.find(code)-5):text.find(code)+10]
+            if re.search(r'\d{3}[-.]?\d{3}[-.]?\d{4}', context):  # phone number
+                continue
+            if f"({code})" not in text:
+                valid_cpts.insert(0, code)  # Prefer non-parenthetical
+            else:
+                valid_cpts.append(code)
+        if valid_cpts:
+            return valid_cpts[0]
+
+    # Revenue codes (4 digits, often starting with 0) - lowest priority
+    # Only use if no CPT/HCPCS found
     match = re.search(r'\b(0\d{3})\b', text)
     if match:
         return match.group(1)

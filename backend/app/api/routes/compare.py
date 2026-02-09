@@ -56,6 +56,7 @@ class CMSData(BaseModel):
     facility_avg_payment: Optional[float]
     data_source: Optional[str]
     description: Optional[str]
+    match_warning: Optional[str] = None  # Warning if description doesn't match bill
 
 
 class PriceComparison(BaseModel):
@@ -108,10 +109,19 @@ def assess_price_cms(billed: float, cms_data: Optional[dict]) -> tuple:
         return ("unknown", None, None, None)
 
     # Determine the best reference price from CMS data
-    # Priority: facility payment > physician payment > submitted charges
+    # Priority: drug ASP > facility payment > physician payment
     fair_price = None
 
-    if cms_data.get("facility_fee") and cms_data["facility_fee"]:
+    # Check drug pricing first (for J-codes, Q-codes)
+    if cms_data.get("drug_pricing") and cms_data["drug_pricing"]:
+        drug = cms_data["drug_pricing"]
+        # ASP price is per unit - use avg_spending_per_unit as it's more comparable to billed amounts
+        if drug.get("avg_spending_per_unit"):
+            fair_price = drug["avg_spending_per_unit"]
+        elif drug.get("asp_price"):
+            fair_price = drug["asp_price"]
+
+    if fair_price is None and cms_data.get("facility_fee") and cms_data["facility_fee"]:
         facility = cms_data["facility_fee"]
         if facility.get("facility_payment", {}).get("average"):
             fair_price = facility["facility_payment"]["average"]
@@ -167,6 +177,8 @@ def extract_cms_summary(cms_pricing: dict) -> Optional[CMSData]:
 
     physician = cms_pricing.get("physician_fee")
     facility = cms_pricing.get("facility_fee")
+    drug = cms_pricing.get("drug_pricing")
+    description_match = cms_pricing.get("description_match")
 
     medicare_payment = None
     medicare_min = None
@@ -175,16 +187,37 @@ def extract_cms_summary(cms_pricing: dict) -> Optional[CMSData]:
     facility_payment = None
     description = None
     data_source = []
+    match_warning = None
+
+    # Check for description mismatch warning
+    if description_match and not cms_pricing.get("has_reliable_data", True):
+        match_warning = description_match.get("reason", "Description may not match billed service")
+
+    # Check drug pricing first (for J-codes, Q-codes)
+    if drug:
+        # For drugs, use avg_spending_per_unit as the primary price
+        medicare_payment = drug.get("avg_spending_per_unit") or drug.get("asp_price")
+        # Drug datasets don't have min/max in the same way
+        medicare_min = drug.get("asp_price")  # ASP is often the floor
+        medicare_max = None
+        description = drug.get("description")
+        if drug.get("brand_name"):
+            description = f"{description} ({drug.get('brand_name')})"
+        data_source.append("Medicare Part B Drug Spending (ASP)")
 
     if physician:
         mp = physician.get("medicare_payment", {})
-        medicare_payment = mp.get("average")
-        medicare_min = mp.get("min")
-        medicare_max = mp.get("max")
+        if not medicare_payment:
+            medicare_payment = mp.get("average")
+        if not medicare_min:
+            medicare_min = mp.get("min")
+        if not medicare_max:
+            medicare_max = mp.get("max")
         sc = physician.get("submitted_charges", {})
         if sc:
             submitted_charge = sc.get("average")
-        description = physician.get("description")
+        if not description:
+            description = physician.get("description")
         data_source.append("Medicare Physician Fee Schedule")
 
     if facility:
@@ -205,6 +238,7 @@ def extract_cms_summary(cms_pricing: dict) -> Optional[CMSData]:
         facility_avg_payment=facility_payment,
         data_source=", ".join(data_source) if data_source else None,
         description=description,
+        match_warning=match_warning,
     )
 
 
@@ -220,26 +254,39 @@ async def compare_charges(request: CompareRequest):
     if not hospital:
         raise HTTPException(status_code=404, detail="Hospital not found")
 
-    # Collect unique codes for batch CMS lookup
-    codes = [item.code for item in request.line_items if item.code]
+    # Collect code-description pairs for batch CMS lookup with validation
+    code_desc_pairs = [
+        (item.code, item.description)
+        for item in request.line_items
+        if item.code
+    ]
 
-    # Fetch CMS data for all codes
+    # Fetch CMS data for all codes with description validation
     cms_pricing_data = {}
     data_sources_used = set()
 
-    if request.use_cms_data and codes:
+    if request.use_cms_data and code_desc_pairs:
         try:
             cms_service = get_cms_service()
-            cms_pricing_data = cms_service.get_pricing_for_codes(codes)
+            cms_pricing_data = cms_service.get_pricing_for_codes(code_desc_pairs)
             logger.info(f"Fetched CMS data for {len(cms_pricing_data)} codes")
 
-            # Track which data sources were used
+            # Track which data sources were used (only count reliable matches)
             for code, data in cms_pricing_data.items():
-                if data.get("has_data"):
+                if data.get("has_reliable_data", data.get("has_data")):
                     if data.get("physician_fee"):
                         data_sources_used.add("CMS Medicare Physician Data")
                     if data.get("facility_fee"):
                         data_sources_used.add("CMS Medicare Outpatient Data")
+                    if data.get("drug_pricing"):
+                        data_sources_used.add("CMS Medicare Part B Drug Spending")
+                elif data.get("has_data") and not data.get("has_reliable_data"):
+                    # Log when we skip data due to description mismatch
+                    match_info = data.get("description_match", {})
+                    logger.info(
+                        f"Skipped CMS data for {code} due to description mismatch: "
+                        f"{match_info.get('reason', 'unknown')}"
+                    )
         except Exception as e:
             logger.error(f"Failed to fetch CMS data: {e}")
             # Continue with mock data
@@ -276,9 +323,10 @@ async def compare_charges(request: CompareRequest):
                         negotiated_rate=price_info["price"]["negotiated_rate"],
                     ))
 
-        # Assess the price - prefer CMS data, fall back to mock
+        # Assess the price - prefer CMS data (only if reliable), fall back to mock
         fair_price = None
-        if cms_pricing and cms_pricing.get("has_data"):
+        # Use has_reliable_data to skip mismatched descriptions (e.g., drug billed as surgery code)
+        if cms_pricing and cms_pricing.get("has_reliable_data", cms_pricing.get("has_data")):
             status, variance, savings, fair_price = assess_price_cms(item.amount, cms_pricing)
         elif hospital_price:
             gross_charge = hospital_price["gross_charge"]

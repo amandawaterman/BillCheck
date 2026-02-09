@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { apiClient } from "@/lib/api-client";
-import { Upload, Search, Building2, ArrowLeft, CheckCircle, AlertTriangle, XCircle, HelpCircle } from "lucide-react";
+import { Upload, Search, Building2, ArrowLeft, CheckCircle, AlertTriangle, XCircle, HelpCircle, FileSearch, Database, Shield } from "lucide-react";
 
 // Types
 interface LineItem {
@@ -44,6 +44,7 @@ interface CMSData {
   facility_avg_payment?: number;
   data_source?: string;
   description?: string;
+  match_warning?: string;
 }
 
 interface LineItemComparison {
@@ -110,6 +111,7 @@ export default function Home() {
   // Comparison state
   const [comparing, setComparing] = useState(false);
   const [comparisonResult, setComparisonResult] = useState<CompareResponse | null>(null);
+  const [analysisMessage, setAnalysisMessage] = useState(0);
 
   // Detected hospital state
   const [detectedHospital, setDetectedHospital] = useState<DetectedHospital | null>(null);
@@ -126,6 +128,18 @@ export default function Home() {
     };
     checkApi();
   }, []);
+
+  // Rotate analysis messages while comparing
+  useEffect(() => {
+    if (!comparing) {
+      setAnalysisMessage(0);
+      return;
+    }
+    const interval = setInterval(() => {
+      setAnalysisMessage((prev) => (prev + 1) % 4);
+    }, 2500);
+    return () => clearInterval(interval);
+  }, [comparing]);
 
   // Load hospitals on mount
   useEffect(() => {
@@ -400,7 +414,7 @@ export default function Home() {
         )}
 
         {/* Step 3: Select Hospital */}
-        {step === "hospital" && (
+        {step === "hospital" && !comparing && (
           <div className="border rounded-lg p-6">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-xl font-semibold">Select Your Hospital</h2>
@@ -496,8 +510,58 @@ export default function Home() {
               disabled={!selectedHospital || comparing}
               className="w-full py-3 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {comparing ? "Comparing..." : "Compare Prices"}
+              Compare Prices
             </button>
+          </div>
+        )}
+
+        {/* Analyzing Screen */}
+        {comparing && (
+          <div className="border rounded-lg p-8 md:p-12 min-h-[60vh] flex items-center justify-center">
+            <div className="flex flex-col items-center text-center">
+              {/* Animated visual */}
+              <div className="relative mb-8">
+                {/* Outer rotating ring */}
+                <div className="w-32 h-32 rounded-full border-4 border-primary/20 animate-[spin_3s_linear_infinite]">
+                  <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1/2 w-3 h-3 bg-primary rounded-full" />
+                </div>
+                {/* Inner pulsing circle with icon */}
+                <div className="absolute inset-4 rounded-full bg-primary/10 animate-pulse flex items-center justify-center">
+                  {analysisMessage === 0 && <FileSearch className="w-10 h-10 text-primary" />}
+                  {analysisMessage === 1 && <Database className="w-10 h-10 text-primary" />}
+                  {analysisMessage === 2 && <Shield className="w-10 h-10 text-primary" />}
+                  {analysisMessage === 3 && <CheckCircle className="w-10 h-10 text-primary" />}
+                </div>
+              </div>
+
+              {/* Progress messages */}
+              <h2 className="text-xl font-semibold mb-2">Analyzing Your Bill</h2>
+              <div className="h-12 flex items-center">
+                <p className="text-muted-foreground transition-opacity duration-300">
+                  {analysisMessage === 0 && "Reviewing your line items..."}
+                  {analysisMessage === 1 && "Fetching CMS Medicare pricing data..."}
+                  {analysisMessage === 2 && "Comparing against fair market rates..."}
+                  {analysisMessage === 3 && "Preparing your personalized report..."}
+                </p>
+              </div>
+
+              {/* Progress bar */}
+              <div className="w-full max-w-xs mt-6">
+                <div className="h-1.5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-primary rounded-full transition-all duration-500 ease-out"
+                    style={{ width: `${((analysisMessage + 1) / 4) * 100}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Reassuring text */}
+              <div className="mt-8 p-4 bg-muted/50 rounded-lg max-w-md">
+                <p className="text-sm text-muted-foreground">
+                  We're comparing your charges against official CMS Medicare data to help you understand if your bill is fairly priced. Your data is processed securely and never stored.
+                </p>
+              </div>
+            </div>
           </div>
         )}
 
@@ -584,8 +648,21 @@ export default function Home() {
 
                     {/* CMS Medicare Data */}
                     {item.cms_data && (
-                      <div className="mt-3 pt-3 border-t">
-                        <p className="text-xs text-muted-foreground mb-2">CMS Medicare Data</p>
+                      <div className={`mt-3 pt-3 border-t ${item.cms_data.match_warning ? 'opacity-60' : ''}`}>
+                        <div className="flex items-center gap-2 mb-2">
+                          <p className="text-xs text-muted-foreground">CMS Medicare Data</p>
+                          {item.cms_data.match_warning && (
+                            <span className="text-xs px-2 py-0.5 bg-yellow-100 text-yellow-700 rounded">
+                              Code Mismatch
+                            </span>
+                          )}
+                        </div>
+                        {item.cms_data.match_warning && (
+                          <div className="mb-3 p-2 bg-yellow-50 border border-yellow-200 rounded text-xs text-yellow-800 flex items-start gap-2">
+                            <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+                            <span>{item.cms_data.match_warning}. This pricing data was not used for comparison.</span>
+                          </div>
+                        )}
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                           {item.cms_data.medicare_avg_payment && (
                             <div>
